@@ -1,0 +1,352 @@
+---
+title: "Learning the Drug Targets"
+author: "Amir Asiaee"
+date: '`r format(Sys.Date(), "%d %B, %Y")`' # Formats the date
+output: 
+  html_document:
+    toc: true # Adds a table of contents
+    toc_float: true # Floats the table of contents
+    toc_depth: 2 # Sets depth of headers to include in TOC
+    number_sections: true # Numbers the sections
+    highlight: kate # Syntax highlighting style
+    theme: yeti # Bootswatch theme
+    fig_width: 10 # Width of figures in inches
+    fig_height: 6 # Height of figures in inches
+    css: styles.css # Link to an external CSS file
+---
+
+# Conclusion
+
+
+# Getting Started
+```{r paths}
+rm(list = ls())
+source("00-paths.R")
+
+load(file.path(paths$clean, 'experiment_file_dictionary.rda'))
+load(file.path(paths$clean, 'alls.rda'))
+```
+
+# Thoughts on Target Learning
+The goal here is to detect the target of drugs. Ideally, if we have enough number of environments (cell types), and we take an intersection of genes that are differentially expressed in those environments compared to unperturbed state, we can find the targets of the drug. 
+
+- If the number of environments are small, then we may find many downstream genes by mistake. 
+- If the target is not expressed in a cell type, then we may have issues:as candidates for target of perturbation 1, we should look at: (set of differentially expressed genes in cell type 1 compared to unperturbed cells of type 1 || set of genes that are zero in unperturbed cells of type 1) && (set of differentially expressed genes in cell type 2 compared to unperturbed cells of type 2 || set of genes that are zero in unperturbed cells of type 2) && ...
+- If the number of environments are large, then we may not find any target (the intersection is empty)
+- How to do differential gene expression analysis? Now we have two conditions: (perturbed by drug1, unperturbed) and each with a matrix of cell-by-gene. How does people in sc-RNA seq do this? Potential uneducated idea: random resampling and forming many pseudo-bulk data and run Limma with intercept + condition variables. 
+- Remember that we have not taken the log2 before from the normalized counts. 
+
+
+# Limma for Bulk Data Computed from Resampled Single Cell 
+
+Here, we explore the idea of resampling the single cell data of each experiment, then make various bulk data for each (celltype, perturbation) pair and its corresponding (celltype, unperturbed) experiment, then do Limme DE to find an ordered list of the genes that are perturbed and then take the intersection of this ordered list across various cell types to find a target. 
+
+First some basic functions for bootstrapping and DEA and also generating BS samples for unperturbed state of each cell type onces:
+```{r , warning = FALSE}
+library(limma)
+library(edgeR)
+
+set.seed(123)
+control_compound <- 'LSM-36361'
+
+# Bootstrap function: Resample cells with replacement and create pseudo-bulk samples
+bootstrap_pseudo_bulk <- function(cell_matrix, n) {
+  boot_samples <- replicate(n, {
+    sample_indices <- sample(nrow(cell_matrix), replace = TRUE)
+    colSums(cell_matrix[sample_indices, , drop = FALSE])
+  }, simplify = FALSE)
+  do.call(cbind, boot_samples)
+}
+
+# Function to perform DEA using Limma on bootstrapped pseudo-bulk data
+perform_dea <- function(pseudo_bulks_U, pseudo_bulks_P, n_bootstraps) {
+  pseudo_bulk_matrix <- cbind(pseudo_bulks_P, pseudo_bulks_U)
+  conditions <- factor(rep(c("perturbed", "unperturbed"), each = n_bootstraps))
+  design_matrix <- model.matrix(~ conditions)  
+  dge <- DGEList(counts = pseudo_bulk_matrix)
+  dge <- calcNormFactors(dge)
+  v <- voom(dge, design_matrix, plot = FALSE)
+  fit <- lmFit(v, design_matrix)
+  return(fit)
+}
+
+```
+
+
+## Coarse Analysis
+Next to find the intersection of this lists, I increase their sizes by 100 and look until the size of intersection passes 100. Note that the gene lists are ordered as `order(abs(t_g$logFC) * -log10(t_g$P.Value), decreasing = TRUE)` which mean both the effect size and the p-value are important for us. 
+```{r , warning = FALSE}
+# Function to find intersection of top genes across cell types for a drug
+find_gene_intersection <- function(fit_list, max_genes = 10) {
+  intersection <- NULL
+  n <- 100
+  top_genes_list <- lapply(fit_list, function(fit) {
+    fit <- eBayes(fit)
+    top_genes <- topTable(fit, adjust = "BH", sort.by = "none", number = Inf)
+  })
+  repeat {
+    selected_genes_list <- lapply(top_genes_list, function(t_g)
+                                  rownames(t_g)[order(abs(t_g$logFC) * -log10(t_g$P.Value), 
+                                                            decreasing = TRUE)[1:n]])
+    
+    intersection <- Reduce(intersect, selected_genes_list)
+    if (length(intersection) > max_genes || n >= nrow(fit_list[[1]]$coefficients)) {
+      break
+    }
+    n <- n + 100 # Increase n if not enough intersections found
+  }
+  print(paste("Intersection requirement met at n=", n, "with size", length(intersection)))
+  return(intersection)
+}
+
+f <- file.path(paths$clean, 'limma_fits_target_learning.rda')
+if(!file.exists(f)){
+  n_bootstraps <- 100
+  # Precompute control pseudo-bulks for each cell type
+  control_pseudo_bulks <- list()
+  for (cell_type in names(experiments_file)) {
+    cat("Pseudobulking for unperturbed cells of type:", cell_type, "\n")
+    load(file.path(paths$clean, paste0(experiments_file[[cell_type]][[control_compound]])))
+    control_pseudo_bulks[[cell_type]] <- bootstrap_pseudo_bulk(M, n_bootstraps)
+  }
+  
+  # List to store Limma fits for drugs across cell types
+  fit_list <- list()
+  drug_target_list <- list()
+  for (drug in all_drugs) {
+    if(drug == 'LSM-36361') next # Skip control
+    cat("Starting target learning for drug:", drug, "\n")
+    drug_start_time <- Sys.time()
+    
+  
+    fit_list[[drug]] <- list()
+    for (cell_type in all_cell_types) {
+      load(file.path(paths$clean, paste0(experiments_file[[cell_type]][[drug]])))
+      if(is.null(M)) next
+      pseudo_bulks_P <- bootstrap_pseudo_bulk(M, n_bootstraps)
+      # Get control pseudo-bulks for this cell type
+      pseudo_bulks_U <- control_pseudo_bulks[[cell_type]]
+      
+      fit <- perform_dea(pseudo_bulks_U, pseudo_bulks_P, n_bootstraps)
+      fit_list[[drug]][[cell_type]] <- fit
+    }
+    # Find intersection of top genes across all cell types for this drug
+    cat("Working on the intersection...")
+    top_genes_intersection <- find_gene_intersection(fit_list[[drug]])
+    drug_target_list[[drug]] <- top_genes_intersection
+    
+    cat("Found intersection of top genes for drug:", drug, "with fewer than 10 genes\n")
+    
+    drug_end_time <- Sys.time()
+    cat("Completed processing for drug:", drug, 
+        "in", round(drug_end_time - drug_start_time, 2), "seconds\n\n")
+  }
+  
+  # Save the Limma fits if needed
+  
+  save(drug_target_list, file = file.path(paths$scratch, 'potential_targets_around_10.rda'))
+  save(fit_list, file = f)
+}
+load(f)
+fit_list[[1]][[1]]
+```
+
+
+# Refined Intersection Selection
+
+I'm not satisfied with this ad-hoc way of taking the intersection. So, here is a more refined version of the same algorithm:
+We generate step like plots where the x-axis is the size of the sorted gene lists (based on DEA results) and the y-axis is the size of the intersection of the list across the cell-types. The first intersection that is stable enough (remains the same for a long time as we increase the size of the lists) is the set of our targets. We also add some criteria to lists: A gene is ineresting if its LFC is at least 1 (it is at least doubled or halved) and its p-value < 0.05. Based on eye-balling the p-values the second condition is not that necessary because almost all genes are significant. 
+
+## Step Plots
+First generate, save, and plot the data for step plots. 
+
+```{r , warning = FALSE}
+library(ggplot2)
+
+num_genes <- length(all_genes)
+
+find_gene_intersection_refined <- function(fit_list, drug, max_genes = 10, logfc_threshold = 1) {
+  intersection_sizes <- c() 
+  top_genes_list <- lapply(fit_list, function(fit) {
+    fit <- eBayes(fit)
+    top_genes <- topTable(fit, adjust = "BH", sort.by = "none", number = Inf)
+    # par(mfrow=c(1,2))
+    # hist(top_genes$logFC, breaks = 123)
+    # hist(-log10(top_genes$P.Value), breaks = 123)
+    # top_genes[abs(top_genes$logFC) > logfc_threshold & top_genes$P.Value < 0.05, ]
+    top_genes[top_genes$P.Value < 0.05, ]
+  })
+  n <- 1  
+  intersection_list <- list()
+  repeat {
+    if (n %% 100 == 1) cat(paste0(n, '.'))
+    # selected_genes_list <- lapply(top_genes_list, function(t_g)
+    #                               rownames(t_g)[order(abs(t_g$logFC) * -log10(t_g$P.Value), 
+    #                                                         decreasing = TRUE)[1:n]])
+    selected_genes_list <- lapply(top_genes_list, function(t_g)
+                                  rownames(t_g)[order(abs(t_g$logFC), decreasing = T)[1:n]])
+    
+    intersection <- Reduce(intersect, selected_genes_list)
+    intersection_list[[n]] <- intersection
+    intersection_sizes <- c(intersection_sizes, length(intersection))
+    
+    if (length(intersection) > max_genes || n >= num_genes) {
+      break
+    }
+    n <- n + 1
+  }
+  cat('\n')
+  
+  step_data <- data.frame(NumberTopGenes = 1:n,
+                           IntersectionSize = intersection_sizes)
+  
+  save(step_data, file = file.path(paths$clean, paste0('step_data_', drug, '.rda')))
+  
+  print(paste("Intersection requirement met at n=", n, "with size", length(intersection)))
+  return(list(intersection_list = intersection_list, step_data = step_data))
+}
+
+f <- file.path(paths$scratch, 'drug_target_list_of_lists_log2fc.rda')
+if(!file.exists(f)){
+  drug_target_list_of_lists <- list()
+  for (drug in all_drugs) {
+    if(drug == 'LSM-36361') next # Skip control
+    cat("Starting target learning for drug:", drug, "\n")
+    
+    intersection_results <- find_gene_intersection_refined(fit_list[[drug]], drug, max_genes = 10)
+    drug_target_list_of_lists[[drug]] <- intersection_results$intersection_list
+    
+    step_plot <- ggplot(intersection_results$step_data, aes(x = NumberTopGenes, y = IntersectionSize)) +
+      geom_point() +
+      geom_line() +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white", colour = "white")) +  # Ensure white panel background
+      ggtitle(paste("Step Plot for Drug", drug))
+    
+    # print(step_plot)
+    ggsave(file.path(paths$results, paste0('step_plot_log2fc_', drug, '.png')), step_plot, bg = "white")
+  }
+  
+  save(drug_target_list_of_lists, file = f)
+}
+load(f)
+drug_target_list_of_lists$`LSM-43181`[[1]]
+drug_target_list_of_lists$`LSM-43181`[[1000]]
+```
+
+## Selecting the Best Intersection: Direct Drug Targets
+Now selecting the best intersection using the step plots. The question is how long should be the "waiting/persistant time" to be long enough for a gene set (intersection set)? Twice the mean length of steps, perhaps. The logic is: if the waiting time is possion then twice the mean = mean + one sd.  
+
+```{r , warning = FALSE}
+calculate_waiting_times <- function(intersection_list, max_genes = 10) {
+  prev_size <- 0
+  last_change_index <- 1
+  waiting_times <- c()
+  unique_target_lists <- list()
+  # Loop through the intersection list to calculate waiting times
+  for (i in seq_along(intersection_list)) {
+    current_size <- length(intersection_list[[i]])
+    # Check if the intersection size has changed (step) and is not the last one if it's less than 10
+    if (current_size != prev_size && !(i == length(intersection_list) && current_size < max_genes)) {
+      # Calculate the waiting time for this step
+      unique_target_lists[[length(unique_target_lists) + 1]] <- intersection_list[[i]]
+      waiting_times <- c(waiting_times, i - last_change_index)
+      prev_size <- current_size
+      last_change_index <- i
+    }
+  }
+  
+  # Calculate the average waiting time excluding the first step
+  avg_waiting_time <- mean(waiting_times[-1]) # Exclude the first waiting time (from 0 to the first step)
+  # Find the point which its length is twice the average waiting time
+  target_point <- which(waiting_times[-1] >= 2 * avg_waiting_time)[1] 
+  if(is.na(target_point)) target_point <- which.max(waiting_times[-1]) 
+  
+  return(list(
+    average_waiting_time = avg_waiting_time,
+    waiting_times = waiting_times,
+    target_point = target_point, 
+    unique_target_lists = unique_target_lists
+  ))
+}
+
+f <- file.path(paths$scratch, 'drug_direct_target_log2fc.rda')
+if(!file.exists(f)){
+  # waiting_time_results <- list()
+  drug_direct_target <- list()
+  for (drug in names(drug_target_list_of_lists)) {
+    results <- calculate_waiting_times(drug_target_list_of_lists[[drug]], max_genes = 10)
+    # waiting_time_results[[drug]] <- results
+    drug_direct_target[[drug]] <- unlist(results$unique_target_lists[results$target_point])
+  #   cat("Drug:", drug, "\n")
+  #   cat("All waiting times", results$waiting_times, "\n")
+  #   cat("Average waiting time (excluding the first step):", results$average_waiting_time, "\n")
+  #   cat("Number of steps to the target point:", results$target_point, "with length of selected step:", results$waiting_times[results$target_point+1], "\n\n")
+  #   print(paste("Selected drug target genes", results$unique_target_lists[results$target_point], "\n"))
+  }
+  
+  # Save the results
+  save(drug_direct_target, file = f)
+}
+load(f)
+drug_direct_target[[1]]
+```
+
+## Computing the Direct Drug Effects: Weight of Drug -> Target Gene 
+Now we go back to the fitted limma models for the found target genes and extract the coefficients of the perturbation. Note that this is in log fold change scale. 
+```{r , warning = FALSE}
+f <- file.path(paths$clean, 'average_drug_effects_log2fc.rda')
+if(!file.exists(f)){
+  load(file.path(paths$clean, 'limma_fits_target_learning.rda'))
+  
+  drug_perturbation_coefficients <- list()
+  average_drug_effects <- list()
+  
+  
+  for (drug in all_drugs) {
+    if(drug == 'LSM-36361') next # Skip control
+    direct_targets <- drug_direct_target[[drug]]
+    
+    drug_coefficients <- list()
+    for (cell_type in names(fit_list[[drug]])) {
+      fit <- fit_list[[drug]][[cell_type]]
+      
+      # Extract the coefficients
+      coefficients_matrix <- -fit$coefficients[rownames(fit$coefficients) %in% direct_targets, "conditionsunperturbed", drop = FALSE]
+      
+      # Convert the matrix to a named vector
+      coefficients_vector <- setNames(coefficients_matrix[, 1], rownames(coefficients_matrix))
+      
+      drug_coefficients[[cell_type]] <- coefficients_vector
+    }
+    drug_perturbation_coefficients[[drug]] <- drug_coefficients
+    
+    combined_coefficients_df <- do.call(cbind, drug_coefficients)
+    average_effect <- rowMeans(combined_coefficients_df, na.rm = TRUE)
+    average_drug_effects[[drug]] <- average_effect
+  }
+  
+  save(drug_perturbation_coefficients, file = file.path(paths$scratch, 'drug_perturbation_coefficients_log2fc.rda'))
+  save(average_drug_effects, file = f)
+}
+load(f)
+average_drug_effects[1:10]
+```
+
+But I'm not sure if this is correct, because IDH2 is coming up abnormally a lot:
+
+```{r , warning = FALSE}
+sort(table(unlist(lapply(average_drug_effects, names))), decreasing = T)
+```
+
+# Borrowing Information from Other Drugs
+One alternative way of building the lists (for taking their intersection afterward), is to factor in the fact that if a cell type is not expressing a gene, even if that gene is a target, we do no see significant change in its value. Note that usually the drug job is inhibition and for inhibition to work we need the target to be present. 
+
+# Single Cell Seurat
+
+# Appendix
+It's always a good idea to finish up by reporting which versions of the
+software tools were used for this analysis:
+```{r si}
+sessionInfo()
+```

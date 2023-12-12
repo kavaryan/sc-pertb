@@ -1,0 +1,6 @@
+cmappy
+pandas
+numpy
+matplotlib
+tqdm
+scipy

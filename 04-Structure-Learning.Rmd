@@ -1,0 +1,258 @@
+---
+title: "Learning the SCM Model of GRN of each Cell Types"
+author: "Amir Asiaee"
+date: '`r format(Sys.Date(), "%d %B, %Y")`' # Formats the date
+output: 
+  html_document:
+    toc: true # Adds a table of contents
+    toc_float: true # Floats the table of contents
+    toc_depth: 2 # Sets depth of headers to include in TOC
+    number_sections: true # Numbers the sections
+    highlight: kate # Syntax highlighting style
+    theme: yeti # Bootswatch theme
+    fig_width: 10 # Width of figures in inches
+    fig_height: 6 # Height of figures in inches
+    css: styles.css # Link to an external CSS file
+---
+
+# Conclusion
+
+
+# Getting Started
+```{r paths}
+rm(list = ls())
+source("00-paths.R")
+
+load(file.path(paths$clean, 'experiment_file_dictionary.rda'))
+load(file.path(paths$clean, 'alls.rda'))
+load(file.path(paths$clean, 'average_drug_effects_log2fc.rda'))
+```
+
+# Thoughts on Structure Learning
+The goal here is to learn the causal GRN for each cell type. The parameters of a causal model for drug perturbation consist of $(B, \Omega, A)$ where the B is the GRN and $\Omega$ is the exogeneous noise's inverse covariance and A is the drug target and weights. So far we have learned A and assume Omega is identity and we want to learn B. It should be a DAG or stable cycle. 
+For now, we assume stable cyclic and the goal is to find a B and project it back to this space. 
+
+Here is the formula that we need. Assume that we have Linear Gaussian Causal Model (LGCM) when the structural equations are all linear and the noises are jointly Gaussian and the drugs are causing shift intervention. Here is how you can represent the stable state of the system:
+
+$$X = XB + DA + E, \quad X,E \in \mathbb{R}^{n\times p}, B \in \mathbb{R}^{p\times p}, D \in \mathbb{R}^{n \times d}, A \in \mathbb{R}^{d \times p}, \forall i\in[n]: E_{i:}\sim N(0, \Omega^{-1}) $$
+where $d$ is the number of drugs, $n$ is the number of samples, and $p$ is the number of genes. Here, $B$ represents the GRN, i.e., a graph of genes and $A$ represents a bipartite graph between drugs and genes and $D$ is the perturbation indicator matrix, i.e., it is a binary matrix where each row $i$ corresponds to the drugs that are used for sample $i$. 
+
+Then for learning the causal model of this universe we need to learn $(B, A, \Omega)$, where we have already learned $A$ from our target learning step and for now assume $\Omega = I$. The score-based formulation of causal discovery problem reduces to MLE in the following OLS:
+$$argmin_B \|Y - XB \|_F, \quad Y = X - DA, B \in \Theta$$
+Here the constraint set $\Theta$ is either the set of DAGs or stable cyclic gaphs where $\max_i |\lambda_i(B)| < 1$. Note that B is cell type dependent and for now, we assume there is no relationship between B of various cell types. We means that we should learn them separately, i.e., we need to learn them for only the test cell types. 
+
+# Making Matrix X
+For each test cell type (B cell and Myloid), we need to lump together all single cells (around 40,000 in total but only 18 experiments are observed for the test drugs) and all genes. Learning is going to be infeasible or very hard with 20,000 genes. So we need to reduce them. We should keep drug targets and genes that are highly variable in unperturbed state and in other experiments of the cell line of interest. 
+
+```{r , warning = FALSE}
+library(Matrix)
+library(limma)
+library(edgeR)
+
+# Function to normalize matrix to log2 CPM
+normalize_log_cpm <- function(M) {
+  cpm <- cpm(M)
+  log_cpm <- log2(cpm + 1)  # Adding 1 to avoid log(0)
+  return(log_cpm)
+}
+
+# Function to compute dispersion (sd/mean) and identify highly variable genes
+compute_highly_variable_genes <- function(M, threshold = 1) {
+  gene_means <- colMeans(M)
+  gene_sds <- apply(M, 2, sd)
+  plot(gene_means, gene_sds)
+  gene_dispersion <- gene_sds / gene_means
+  hist(gene_dispersion, breaks = 123)
+  hv_genes <- names(gene_dispersion[gene_dispersion > threshold & 
+                                     !is.na(gene_dispersion) &
+                                     !is.infinite(gene_dispersion) &
+                                     !is.nan(gene_dispersion)])
+  return(hv_genes)
+}
+
+magicThreshold <- 20
+for (cell_type in c('B cells', 'Myeloid cells')) {
+  cat("Starting preparation for structure learning for cell type:", cell_type, "\n")
+  celltype_start_time <- Sys.time()
+  
+  X <- NULL 
+  existing_drugs <- c()
+  number_of_cells <- list()
+  # Initialize all_hv_genes with genes affected by all drugs
+  all_drug_targets <- unique(unlist(lapply(average_drug_effects, names)))
+  all_hv_genes <- all_drug_targets
+  
+  for (drug in all_drugs) {
+    # if(drug == 'LSM-36361') next # Skip control
+    load(file.path(paths$clean, paste0(experiments_file[[cell_type]][[drug]])))
+    if(is.null(M)) next
+    if(nrow(M) < 10) next #not enough cells for robust hv gene selection
+    cat('Preparing X for drug', drug, '\n')
+    cat('Number of cells = ', nrow(M), '\n')
+    
+    ## Create DGEList object for normalization: gene-by-cell
+    dge <- DGEList(counts = as.matrix(t(M)))
+    dge <- calcNormFactors(dge)
+    
+    log_cpm_M <- t(normalize_log_cpm(dge))  #back to cell-by-gene
+
+    # # Compute highly variable genes
+    # hv_genes <- compute_highly_variable_genes(log_cpm_M, magicThreshold)
+    # # hv_genes <- compute_hv_genes_newman(log_cpm_M, 20)
+    # cat("Number of highly variable genes for drug ", drug, ' is ', length(hv_genes), '\n')
+    # all_hv_genes <- union(all_hv_genes, hv_genes)
+
+    # Append to matrix X
+    X <- rbind(X, log_cpm_M)
+    existing_drugs <- c(existing_drugs, drug)
+    number_of_cells[[drug]] <- nrow(log_cpm_M)
+  }
+  # Compute highly variable genes
+  hv_genes <- compute_highly_variable_genes(X, magicThreshold)
+  # hv_genes <- compute_hv_genes_newman(log_cpm_M, 20)
+  cat("Number of global highly variable genes for drug is ", length(hv_genes), '\n')
+  all_hv_genes <- union(all_hv_genes, hv_genes)
+  
+  D <- NULL
+  A <- NULL
+  for (drug in existing_drugs){
+    cat('Preparing A and D for drug', drug, '\n')
+    # Create and append to matrix D
+    drug_indicator <- matrix(rep(0, length(existing_drugs) * number_of_cells[[drug]]), nrow = number_of_cells[[drug]])
+    colnames(drug_indicator) <- existing_drugs
+    drug_indicator[, drug] <- 1
+    D <- rbind(D, drug_indicator)
+    # Append to matrix A
+    drug_effect_vector <- matrix(rep(0, length(all_hv_genes)), nrow = 1)
+    names(drug_effect_vector) <- all_hv_genes
+    drug_effect_vector[names(average_drug_effects[[drug]])] <- average_drug_effects[[drug]]
+    A <- rbind(A, drug_effect_vector)
+  }
+
+  colnames(D) <- existing_drugs
+  rownames(A) <- existing_drugs
+
+  # Filter columns of X by the retained highly variable genes
+  X <- X[, all_hv_genes]
+  # Form Y = X - DA
+  Y <- X - D %*% A
+
+  save(X, Y, all_hv_genes, A, D, existing_drugs, file = file.path(paste0(paths$scratch, 'structure_learning_data_', cell_type,'.rda')))
+
+  celltype_end_time <- Sys.time()
+  cat("Completed structure learning preparation for cell type:", cell_type, 
+      "in", round(celltype_end_time - celltype_start_time, 2), "seconds\n\n")
+}
+```
+
+Now let's learn the coefficient matrix using MLM, hopefully, p and n are such that we won't need any regulatization:
+```{r , warning = FALSE}
+library(ClassComparison)
+# library(glmnet)
+# library(Rfast)
+
+
+for (cell_type in c('B cells', 'Myeloid cells')) {
+  cat("Starting structure learning for cell type:", cell_type, "\n")
+  celltype_start_time <- Sys.time()
+  
+  load(file.path(paste0(paths$scratch, 'structure_learning_data_', cell_type,'.rda')))
+  
+
+  idx <- sample(nrow(X), 2 * ncol(X))
+  X_subsample <- X[idx, , drop = FALSE]
+  Y_subsample <- Y[idx, , drop = FALSE]
+  
+  
+  corr_matrix <- cor(X_subsample)
+  save(corr_matrix, file= file.path(paste0(paths$scratch, 'corr_x_subsample', cell_type, '.rda')))
+  
+  high_corr_pairs <- which(abs(corr_matrix) > 0.9, arr.ind = TRUE)
+  high_corr_pairs <- high_corr_pairs[high_corr_pairs[,1] < high_corr_pairs[,2], ]
+  # Decide which variable to remove from each pair
+  # Simple heuristic: remove the second variable in each pair
+  remove_indices <- unique(high_corr_pairs[,2])
+  X_reduced <- X_subsample[, -remove_indices, drop = FALSE]
+  Y_reduced <- Y_subsample[, -remove_indices, drop = FALSE]
+
+  
+  mlm <- MultiLinearModel(Y ~ ., X_reduced, t(Y_reduced))
+  save(mlm, file = file.path(paste0(paths$scratch, 'mlm_', cell_type, '.rda')))
+
+  # x <- as.matrix(X)  # Predictor matrix
+  # y <- as.matrix(Y)  # Response matrix
+  # 
+  # # Fit the multi-response elastic-net model
+  # elastic_net_fit <- cv.glmnet(x, y, alpha = .5, family = "mgaussian", parallel = TRUE)
+  # 
+  # # Get the coefficients at the optimal lambda (regularization strength)
+  # opt_lambda <- elastic_net_fit$lambda.min
+  # lasso_coefs <- coef(elastic_net_fit, s = opt_lambda)
+  # 
+  # # Predict with the lasso model
+  # predictions <- predict(elastic_net_fit, newx = x, s = opt_lambda)
+  
+  celltype_end_time <- Sys.time()
+  cat("Completed structure learning for cell type:", cell_type, 
+      "in", round(celltype_end_time - celltype_start_time, 2), "minutes.\n\n")
+}
+```
+
+Now that we have Bs, let's project them back to the stable cylic graphs:
+
+```{r , warning = FALSE}
+# Power iteration to approximate the maximum eigenvalue
+power_iteration <- function(B, tol = 1e-6, max_iter = 100) {
+  n <- nrow(B)
+  v <- rep(1, n) / sqrt(n)
+  lambda <- 0
+  
+  for (i in 1:max_iter) {
+    w <- B %*% v
+    v_new <- w / sqrt(sum(w^2))
+    lambda_new <- sum(w * v)
+    
+    if (abs(lambda_new - lambda) < tol) {
+      break
+    }
+    
+    v <- v_new
+    lambda <- lambda_new
+  }
+  
+  return(lambda)
+}
+
+# Projection of B into stable space
+project_to_stable <- function(B) {
+  lambda_max <- abs(power_iteration(B))
+  
+  if (lambda_max > 1) {
+    B <- B / lambda_max
+  }
+  
+  return(B)
+}
+
+for (cell_type in c('B cells', 'Myeloid cells')) {
+  cat("Starting graph projection for cell type:", cell_type, "\n")
+  celltype_start_time <- Sys.time()
+  
+  load(file.path(paste0(paths$scratch, 'mlm_', cell_type, '.rda')))
+  
+  B <- project_to_stable(mlm$coefficients)
+  save(B, file = file.path(paste0(paths$scratch, 'B_', cell_type, '.rda')))
+  
+  celltype_end_time <- Sys.time()
+  cat("Completed graph projection for cell type:", cell_type, 
+      "in", round(celltype_end_time - celltype_start_time, 2), "seconds\n\n")
+}
+```
+
+
+# Appendix
+It's always a good idea to finish up by reporting which versions of the
+software tools were used for this analysis:
+```{r si}
+sessionInfo()
+```

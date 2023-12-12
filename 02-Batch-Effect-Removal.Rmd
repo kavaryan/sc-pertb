@@ -1,0 +1,261 @@
+---
+title: "Pseudo-Bulk, Limma, and Batch Effect Removal"
+author: "Amir Asiaee"
+date: '`r format(Sys.Date(), "%d %B, %Y")`' # Formats the date
+output: 
+  html_document:
+    toc: true # Adds a table of contents
+    toc_float: true # Floats the table of contents
+    toc_depth: 2 # Sets depth of headers to include in TOC
+    number_sections: true # Numbers the sections
+    highlight: kate # Syntax highlighting style
+    theme: yeti # Bootswatch theme
+    fig_width: 10 # Width of figures in inches
+    fig_height: 6 # Height of figures in inches
+    css: styles.css # Link to an external CSS file
+---
+
+# Conclusion
+- Here we first form pseudo-bulk data for each cell type in each well for training data.
+- We run limma on the pseudo-bulk data and fit log2(CPM) = biology (baseline expression [captured by intercept] + total drug effect) + technology (batch effect of library, plate, donor)
+- We then compute biology = log2(CPM) - technology and redistribute the adjusted counts back to single cell counts (this part is tricky because CPM is normalized)
+- We then concatenate batch-effect-corrected cells of each experiment (pair of (cell type, drug)), then cell normalize them (total experiment per cell = 1) and save them separately. 
+- We save a dictionary of the (cell_type, drug) => file_name in 'experiment_file_dictionary.rda'.
+
+
+
+# Getting Started
+```{r paths}
+rm(list = ls())
+source("00-paths.R")
+
+library(arrow)
+train <- read_parquet(file.path(paths$raw, 'adata_train.parquet'))
+train_meta <- read.csv(file.path(paths$raw, 'adata_obs_meta.csv'))
+
+dim(train)
+dim(train_meta)
+```
+
+# Thoughts about a Road Map
+
+## Separating Biological and Technological Signals
+In general one can think of the observed pseudo-bulk data as $\log2(pseudo-bulk-CPM) = biology + technology + noise$ where the technology is just the batch effect. The noise also can be deconvolve into two parts, but for simplicity we assume that the noise corresponds to biology only. 
+
+## A Causal Framework: Structure Learning + Target Learning
+If we are talking about causality, it makes sense to work with the biology part of the data. I mean, if we know the drug target and effect (through [intervention] target learning) and the causal structure between the genes of the cell type of interest (through [causal] structure learning), then given the drug and cell type we can say: gene 1's expression is doubled by the drug and its corresponding effects propagate through the network and I get the average expression of that network in the biology domain. 
+
+So then when and why should we separate biology from technology? That is necessary when we want to do target and structure learning. We should remove the batch effect to be able to put together the cell types of the same experiments from 3 wells, then use them to do strucutre learning. Also, fore cells in unperturbed state, we can pull together all negative controls of all plates. 
+
+
+## Th P-Value Issue
+But here, we do not have any meaningful p-value for the learned coefficient of the drug. For that we need to generate a null distribution. The null says that there is no effect, and that should be generated from the unperturbed data of the same cell type. One can resample those cells many times and get a distribution of $x_0$. The question is: should we adjust p-values for multiple testing? If their version of limma does that we should do that too. I think they don't adjust the p-values. Because in Limma's [manual](https://bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf) they have `topTable(fit, coef="MUvsWT", adjust="BH")` after calling limma, so the pure call to lmFit (as in their codes) will not adjust the p-values. Moreover, they use empirical Bayes after fitting computing the contrast. I'm not sure about how to replicate the eBays here. But for each cell-type we have all wells to borrow information from. 
+
+# Batch Effect Removal
+The first step is to remove the batch effect to be able to pull together cells. For that we replicate what they do with Limma: pseudo-bulk the data, run Limma (or your own regression), adjust the $\log2(CPM)$ and propagate back this adjustment to the original single cell data. Then pull together samples of each experiment and save them in order. 
+
+## Pseudo-Bulking
+
+```{r , warning = FALSE}
+train_meta$bulk_id <- with(train_meta, paste(plate_name, well, cell_type, sep = "_"))
+  
+## Create a vector that maps obs_id to bulk_id
+bulk_id_vector <- train_meta$bulk_id
+names(bulk_id_vector) <- train_meta$obs_id
+
+## Merge bulk_id into the train dataframe based on obs_id
+train$bulk_id <- bulk_id_vector[train$obs_id]
+
+
+f <- file.path(paths$scratch, "bulk_counts.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  # Pseudo-Bulking
+  ## Combine plate_name, well, and cell_type to create a unique bulk_id
+  bulk_counts <- aggregate(count ~ bulk_id + gene, data = train, sum, na.rm = TRUE)
+  
+  
+  # Merge Metadata
+  ## Map bulk_id to the other four dimensions
+  meta_columns <- train_meta[, c("bulk_id", "donor_id", "plate_name", "library_id", "sm_lincs_id")]
+  ## Remove duplicates (due to many to one mapping from cells obs_id to bulk_id) 
+  ### It should be 12 * 8 * 6 * 6 = 3456 but not all cell types are present in each well: 2558
+  meta_columns <- unique(meta_columns)
+  ## Merge with bulk_counts based on bulk_id
+  bulk_counts <- merge(bulk_counts, meta_columns, by = "bulk_id")
+  
+  bulk_counts$donor_id <- factor(bulk_counts$donor_id)
+  bulk_counts$plate_name <- factor(bulk_counts$plate_name)
+  bulk_counts$library_id <- factor(bulk_counts$library_id)
+  bulk_counts$sm_lincs_id <- factor(bulk_counts$sm_lincs_id)
+  
+  ##Shoot forgot to add cell_type and well (aggregate is time consuming, so patch it up here)
+  cell_type_mapping <- unique(train_meta[, c("bulk_id", "cell_type")])
+  bulk_counts <- merge(bulk_counts, cell_type_mapping, by = "bulk_id", all.x = TRUE)
+  well_mapping <- unique(train_meta[, c("bulk_id", "well")])
+  bulk_counts <- merge(bulk_counts, well_mapping, by = "bulk_id", all.x = TRUE)
+
+# 
+#   # Calculate the proportion of the count that each cell contributes to the bulk count
+#   train <- merge(train, bulk_counts[, c('bulk_id', 'gene', 'count')], by = c("bulk_id", "gene"), suffixes = c("", ".sum"))
+#   train$count.prop <- with(train, count / count.sum)
+
+  save(bulk_counts, file = f)
+}
+rm(f)
+```
+
+## Running Limma 
+
+```{r , warning = FALSE}
+library(edgeR)
+library(limma)
+library(Matrix)
+library(dplyr)
+
+all_cell_types <- unique(train_meta$cell_type)
+all_genes <- unique(train$gene)
+all_drugs <- unique(bulk_counts$sm_lincs_id[])
+smiles_dict <- setNames(train_meta$SMILES, train_meta$sm_lincs_id)
+smiles_dict <- smiles_dict[unique(names(smiles_dict))]
+save(smiles_dict, all_cell_types, all_genes, all_drugs, file=file.path(paths$clean, 'alls.rda'))
+
+set.seed(12345)
+for(cell_type in as.factor(all_cell_types)) {
+  file_name <- paste0('limma_fit__', cell_type, '.rda')
+  f <- file.path(paths$clean, file_name)
+  if(!file.exists(f)){
+    print(paste('Computing batch effect for', cell_type))
+    # Computing Batch Effect
+    cell_type_bulk_counts <- bulk_counts[bulk_counts$cell_type == cell_type, ]
+    
+    ## Making the bulk-by-gene matrix
+    bulk_ids <- factor(cell_type_bulk_counts$bulk_id)
+    genes <- factor(cell_type_bulk_counts$gene, levels = all_genes)
+    ## Prepare the count matrix for edgeR normalization: gene-by-sample
+    count_matrix <- as.matrix(sparseMatrix(i = as.integer(genes), 
+                                           j = as.integer(bulk_ids),
+                                           x = cell_type_bulk_counts$count,
+                                           dims = c(length(all_genes), length(levels(bulk_ids))), 
+                                           dimnames = list(levels(factor(all_genes)), 
+                                                           levels(bulk_ids))))
+    ## Create DGEList object for normalization
+    dge <- DGEList(counts = count_matrix)
+    dge <- calcNormFactors(dge)
+    
+    ## Create a model matrix for the current cell type
+    unique_bulk_metadata <- cell_type_bulk_counts %>%
+      distinct(bulk_id, .keep_all = TRUE) %>%
+      select(donor_id, plate_name, library_id, sm_lincs_id)
+    
+    design <- model.matrix(~ sm_lincs_id + donor_id + plate_name + library_id,
+                           data = unique_bulk_metadata)
+    
+    ## Use voom to transform the counts with mean-variance relationship
+    v <- voom(dge, design, plot = FALSE)
+    
+    ## Fit the linear model with limma
+    fit <- lmFit(v, design)
+    
+    save(fit, file = f)
+  }
+}
+```
+
+
+```{r , warning = FALSE}
+f <- file.path(paths$clean,'experiment_file_dictionary.rda')
+if(!file.exists(f)){
+  load(file=file.path(paths$clean, 'alls.rda'))
+  experiments_file <- list()
+  for(cell_type in as.factor(all_cell_types)) {
+    experiments_file[[cell_type]] <- list()
+    cell_type_bulk_counts <- bulk_counts[bulk_counts$cell_type == cell_type, ]
+    bulk_ids <- factor(cell_type_bulk_counts$bulk_id)
+    n_drugs <- length(levels(unique(cell_type_bulk_counts$sm_lincs_id)))
+  
+    file_name <- paste0('limma_fit__', cell_type, '.rda')
+    load(file.path(paths$clean, file_name))
+    # Remove Batch Effects from Bulk
+    ## Not all coefficients are estimable
+    ## Replace NAs with zeros before multiplication
+    coef_no_na <- ifelse(is.na(fit$coefficients), 0, fit$coefficients)
+    design_no_na <- ifelse(is.na(fit$design), 0, fit$design)
+    batch_effect <- design_no_na[,(n_drugs+1):ncol(fit$design)] %*% t(coef_no_na[,(n_drugs+1):ncol(coef_no_na)])
+    dimnames(batch_effect) <- list(levels(bulk_ids), levels(factor(all_genes)))
+      # list(colnames(count_matrix), rownames(count_matrix))
+    ## Combine batch effect removed data for each drug
+    dd <- 0
+    for(drug in all_drugs){
+      dd <- dd + 1
+      print(paste('Correcting: Cell type =', cell_type, 'Drug =', drug, 'Drug Number=', dd))
+      wells_bulk_id <- unique(bulk_counts$bulk_id[bulk_counts$sm_lincs_id == drug & bulk_counts$cell_type == cell_type])
+      M <- NULL
+      for(b_id in wells_bulk_id){
+        # b_id <- wells_bulk_id[1]
+        ## Making the cell-by-gene matrix
+        current_bulk <- train$bulk_id == b_id
+        cell_ids <- factor(train$obs_id[current_bulk])
+        genes <- factor(train$gene[current_bulk], levels = all_genes)
+        ## Prepare the count matrix for edgeR normalization: gene-by-sample
+        cell_gene_matrix <- sparseMatrix(i = as.integer(cell_ids),
+                                         j = as.integer(genes), 
+                                         x = train$count[current_bulk],
+                                         dims = c(length(levels(cell_ids)), length(all_genes)), 
+                                         dimnames = list(levels(cell_ids), levels(factor(all_genes))))
+        
+        corrected_cell_gene_counts <- sweep(cell_gene_matrix, MARGIN = 2, STAT = 2^(-batch_effect[b_id, ]), FUN = "*")
+        # total_counts_per_cell <- rowSums(corrected_cell_gene_counts)
+        # normalized_corrected_counts <- sweep(corrected_cell_gene_counts, MARGIN = 1, STAT = total_counts_per_cell, FUN = "/")
+        # total_gene_counts <- colSums(cell_gene_matrix)
+        # non_zero_genes <- total_gene_counts > 0
+        # count_proportion <- matrix(0, nrow = nrow(cell_gene_matrix), ncol = ncol(cell_gene_matrix))
+        # count_proportion[,non_zero_genes] <- sweep(cell_gene_matrix[,non_zero_genes], MARGIN = 2, STATS = total_gene_counts[non_zero_genes], FUN = "/")
+        # corrected_cell_gene_matrix <- sweep(count_proportion, MARGIN = 2, STATS = 2^bio_matrix[,b_id], FUN = "*")
+        M <- rbind(M, corrected_cell_gene_counts)
+      }
+      file_name <- paste0(cell_type, '__', drug, '.rda')
+      experiments_file[[cell_type]][[drug]] <- file_name
+      save(M, file = file.path(paths$clean, file_name))
+    }
+  }
+  save(experiments_file, file = f)
+}
+load(f)
+```
+
+OK, let's do a bit of quality control on each cell. It seems people check the number of counts per cell and if it is small they discard the cell: 
+
+```{r , warning = FALSE}
+load(file.path(paths$clean, paste0(experiments_file$`T cells CD4+`$`LSM-5855`)))
+dim(M)
+count_per_cell <- rowSums(M)
+hist(count_per_cell, breaks = 123)
+summary(count_per_cell)
+sum(count_per_cell < 2000)
+
+
+load(file.path(paths$clean, paste0(experiments_file$`NK cells`$`LSM-6303`)))
+dim(M)
+count_per_cell <- rowSums(M)
+hist(count_per_cell, breaks = 123)
+summary(count_per_cell)
+sum(count_per_cell < 2000)
+
+
+load(file.path(paths$clean, paste0(experiments_file$`Myeloid cells`$`LSM-36361`)))
+dim(M)
+count_per_cell <- rowSums(M)
+hist(count_per_cell, breaks = 123)
+summary(count_per_cell)
+sum(count_per_cell < 2000)
+```
+
+I don't think this is bad. The variance seems to be reasonably small and 2000 seems to be a good cutoff and only a few of cells go below it. So I decided not to do any filtering and assume that all cells qualities are good enough. 
+
+# Appendix
+It's always a good idea to finish up by reporting which versions of the software tools were used for this analysis:
+```{r si}
+sessionInfo()
+```
