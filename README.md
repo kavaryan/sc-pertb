@@ -32,6 +32,6 @@ Download raw Homer motifs data from http://homer.ucsd.edu/homer/custom.motifs an
 Download gr38 Human Genome Annotations from https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.annotation.gtf.gz and extract it in working/genome
 
 ## Code
-Code comes in two parts: Two python notebooks to incorporate LINCS and ATAC data and several R codes for batch effect correction, target learning, and causal structure learning, as described in the [report](https://github.com/kavaryan/sc-pertb/report.pdf).
+Code comes in two parts: Two python notebooks to incorporate LINCS and ATAC data and several R codes for batch effect correction, target learning, and causal structure learning, as described in the [report](https://github.com/kavaryan/sc-pertb/blob/master/report.pdf).
 
 
